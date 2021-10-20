@@ -1,0 +1,619 @@
+---
+title: Understanding Health Expenditure through Cluster Analysis and Naive Bayes
+  Classification.
+author: "Anthony Lighterness"
+date: "`r format(Sys.time(), '%d-%m-%Y')`"
+output: bookdown::html_document2
+keywords: cluster, ward, PAM, Naive Bayes, Gower distance
+abstract: 'Healthcare is not only one of the most resource-demanding industries globally, but it also produces some of the most highly dimensional and heterogenous data. With the rise in global health expenditure, the ability to utilise data mining techniques effectively to extract actionable insights and highlight predictable patterns related to cost has never been more important. The current report seeks to emphasise the challenges of unsupervised machine learning for describing real-world, heterogenous medical data. Specifically, the study attempts to identify the relationship between cost and a range of attributes, such as diagnosis, treatment, and length of stay from both unsupervised and supervised perspectives. To do this, a Gower distance matrix followed by principal coordinate analysis (PCoA) and t-stochastic neighbour embedding (tSNE) were performed to visualise partition around medoids (PAM) cluster models in lower dimensional spaces, which were then compared to Wards hierarchical clustering and then lastly to a supervised Naive Bayes (NB) classifier. Visual analysis overall showed that both PAM and Wards hierarchical clustering were able to group some clusters of patients with similar cost outcomes in an unsupervised protocol. The NB model produced 85% and 75% overall accuracy with an AUC of 0.92 and 0.87 when cross validating used 30% of the dataset split and a 10-fold protocol, respectively. The study suffered from the curse of dimensionality during analysis, but is able to showcase the challenges of unsupervised machine learning when attempting to describe nuanced, real world medical data.'
+---
+<style>
+body {
+text-align: justify}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, echo=FALSE, fig.align = "center")
+knitr::opts_chunk$get('rmarkdown.pandoc.to')
+```
+
+```{r libraries, include=FALSE}
+# Libraries and Packages
+options(repos="https://cran.rstudio.com")
+#install.packages(c("tidyverse","e1071","caret","ggplot2","GGally","ggpubr","svglite","dplyr","hrbrthemes","chron","Lahman","Rtsne","ape","FactoMineR", "factoextra","pROC","rafalib", cowplot", "kableExtra",bookdown"))
+library(bookdown)
+library(kableExtra)
+library(cowplot)
+library(rafalib)
+library(pROC)
+library(clustertend)
+library("FactoMineR")
+library("factoextra")
+library(tidyverse)
+library(caret) 
+library(naivebayes)
+library(MASS) # LDA model
+library(ggplot2)
+library(GGally)
+library(ggpubr)
+library(svglite)
+library(dplyr) # for pipelines
+library(hrbrthemes)
+library(ggridges) 
+library(viridis)
+library(klaR) # for partition plots
+library(chron)
+library(ggplot2)
+library(Lahman)
+library(cluster)
+library(Rtsne)
+library(viridisLite)
+library(e1071)
+library(car)
+library(reshape)
+library(purrr)
+library(dendextend)
+library(ape)
+library(plotly)
+```
+
+```{r preprocessing, warning=FALSE, message=FALSE}
+# Data Import and Pre-processing
+data1 = read.csv("Data.csv", header = TRUE, sep = ",", dec = ".")
+
+data2 = data1 %>%
+  # establish date-time variables
+  mutate(Adm.Date = as.Date(Admission.Date, format = '%d/%m/%y'),
+         Dis.Date = as.Date(Discharge.Date, format = '%d/%m/%y'),
+         RTT.Start = as.Date(RTT.Start, format = '%d/%m/%y'),
+         RTT.End = as.Date(RTT.End, format = '%d/%m/%y')) %>%
+  
+  # separate Adm.Time into Date and Time variables
+  separate(Adm.Time, c("Adm.Time.Date", "Adm.Time"), sep = " ") %>%
+  
+  # coerce into 'time' type variable
+  mutate(Adm.Time = chron(times = Adm.Time),
+        # calculate length of stay and length of wait before treatment (RTT.Period)
+         Length.of.Stay = as.numeric(abs(Dis.Date-Adm.Date)),
+         RTT.Period = as.numeric(abs(RTT.End-RTT.Start))) %>%
+  
+  # filter out impossible values
+  filter(Patient.Age>0 & Patient.Age<110 & 
+           RTT.Period<500 & Length.of.Stay<500) %>%
+  
+  # factor variables
+  mutate(Adm.Type = factor(Adm.Type, 
+                           levels = c("Non-Elective", "Elective DC", "Elective IP"), 
+                           labels = c("1", "2", "3")),
+        # discretize Cost variable into a factor of 6 levels containing equal portions 
+         Cost.Class = cut_number(Cost, n = 6)) %>%
+  mutate(Cost.Class = factor(Cost.Class, 
+                             labels = c("1", "2", "3", "4", "5", "6"), ordered = TRUE),
+         Specialty.Code = as.factor(Specialty.Code),
+         PbR = as.factor(PbR)) %>%
+  # select variables of interest
+  dplyr:: select(Adm.Type, HRG4, ICD10, OPCS4, PbR, Patient.Age, Specialty.Code,
+                 Length.of.Stay, RTT.Period, Cost.Class) %>%
+  na.omit() # remove rows with NA 
+
+# Separate class label
+data3 = data2 %>%
+  dplyr:: select(-Cost.Class)
+
+# Relabel cost levels
+cost_label = factor(data2$Cost.Class, 
+                    labels = c("1", "2", "3", "4", "5", "6"))
+
+```
+
+# Introduction 
+Amidst the escalating data revolution comes the need to understand large, complex, and information rich datasets in all fields of technology, business, and science. Health data is no exception to this as it exemplifies the challenges that come with analysing highly dimensional and heterogenous data. With the growing concerns in global health expenditure being ~10% of the total gross domestic product for most highly-income countries such as Australia and the UK, and the rise in ageing populations and chronic disease, comes the need to extract actionable insights hidden within medical data (Mikulic, 2019). Data mining techniques including unsupervised clustering and supervised classification can be used to describe and predict patterns that may highlight the contributing factors to public health expenditure. 
+
+Datasets are heterogeneous in nature when multiple datatypes exist, such as continuous, discrete, and multi-level factor variables. While the literature widely reports the use of homogenous, quantitative datasets, mixed data is an undeniable reality in today’s technologically driven society. From an unsupervised learning perspective, analysts face a myriad of challenges when searching for relevant patterns in highly dimensional and heterogenous data. One of the only solutions for this is to compute the Gower distances between objects, thus allowing observations of similar attributes to exist in clusters. Gower’s method is unique in that it can measure the (dis)similarities between observations that are described by any data types, including categorical, continuous, or multi-level factor variables. As such, it is consistently supported in the literature when preparing complex datasets for partitional and hierarchical cluster analysis (Akay & Yuksel, 2017; Gower, 1966; Gower, 1971). 
+
+While Gower’s (dis)similarity metric overcomes the challenge of heterogenous data, it does not solve the curse of dimensionality. Therefore, the literature shows its use in combination with a dimensionality reduction technique (Belkina et al. 2018; Filaire, 2018; Martin, 2016). Principal component analysis (PCA) is the most widely known and applied tool for dimensionality reduction. Its prevalence dominates the literature such that very few describe its counterpart, principal coordinate analysis (PCoA) – most likely due to the bias against mixed type datasets. Gower (1966) suggested the name PCoA, also known as classical multidimensional scaling (CMDS), to distinguish it from PCA. While both techniques lead to the same solution, PCA is based on a *qxq* matrix of associations between variables, whereas PCoA is based on an *nxn* matrix of (dis)similarities between observations (Gower, 1966). 
+
+While PCoA is more adept at preserving global structure of the data, t-stochastic neighbour embedding (tSNE) is another dimensionality reduction tool that better represents local interactions (Nguyen & Holmes, 2019). As such, the literature reports tSNE to be effective for visualising k-protocol cluster models in lower dimensional spaces (Belkina et al., 2018; Filaire, 2018; Martin, 2016). However, it is cautioned that tSNE does not preserve long-range interactions between data points and therefore may generate visualisations in which the arrangement of non-neighbouring groups of observations is not informative (Nguyen & Holmes, 2019). It is however, supported by the literature in the use for visualisation of unsupervised clustering models such as partition around medoids (PAM) (Belkina et al., 2018; Filaire, 2018; Martin, 2016). 
+
+Unsupervised machine learning functions are evaluated based on their ability to describe patterns within unlabelled data (Jothi et al., 2015). Its counterpart domain, supervised machine learning, can be more quantitatively specific. Indeed, predictive models are trained using a target variable with known labels to then predict and classify new incidences of the same variable (Jothi et al., 2015). Its evaluation therefore produces quantitative metrics, such as ROC-AUC and overall accuracy that describe its ability to correctly predict new labels (Vihinen, 2012). The current report centres its discussions and analyses around two examples of each of supervised and unsupervised learning functions. 
+
+Cluster models aim to group data into sets such that intra-cluster similarity is maximised while inter-cluster similarity minimised (Akay & Yuksel, 2017). These can be divided into two categories: partitional and hierarchical, where the latter can be further classified into agglomerative and divisive algorithms (Akay & Yuksel, 2017). The current investigation concentrates on PAM and Ward’s hierarchical clustering – an agglomerative type. While Ward’s method outperforms its hierarchical counterparts, PAM is overshadowed in the literature by its quantitative equivalent, k-means (Akay & Yuksel, 2017; Park, 2009). Despite this, PAM is reportedly more rigorous against outliers than k-means and is able to handle distance matrices computed from complex mixed type datasets (Budiaji & Leisch, 2019). This is because in PAM models, the centre of a cluster is identified as the object in that specific cluster that lies closest to all other objects (Budiaji & Leisch, 2019). Therefore, it is less impacted by outliers compared to k-means. Agglomerative hierarchical algorithms, in contrast, start by merging smaller clusters until one large cluster is left (Akay & Yuksel, 2017). Although PAM is known to be the most powerful algorithm for k-medoids, its main shortcoming is that it works inefficiently for large datasets due to its time complexity being O(k(n-k)^2^) (Park & Jun, 2009). Due to the limitations of unsupervised techniques, researchers favour reporting of supervised machine learning, particularly in the medical domain (Johti et al., 2015).
+
+Supervised machine learning is much more popular for many reasons, including seamless application, reliable assessment, and utility in predictions (Jothi et al., 2015). One of the most common tasks in supervised learning functions is that of classification (Jothi et al., 2015). A widely used framework for classification is provided by a simple theorem of probability known as Bayes’ rule (Lewis, 1998). Bayesian classifiers take into account all available evidence from mixed data-type explanatory variables to make final predictions and provide transparent explanations of these outcomes (Jothi et al., 2015; Al-Aidaroos et al., 2012). This process is natural and familiar to the decision-making protocols in medicine, ranging from patient diagnosis to billing (Al-Aidaroos et al., 2012). Moreover, it is simple, computationally efficient, and naturally robust to missing and noise-filled data. As such, it is clear why Naïve Bayes is one of the most studied supervised algorithms in the literature.  
+
+The current investigation sought to explore the utility of unsupervised clustering on complex, real hospital data. Specifically, we asked if it is possible to identify similar patterns of health cost when patients are grouped by their (dis)similarities across a range of attributes other attributes. We then wanted to compare these findings with the predictability of cost using the same variables applied in a supervised Naïve Bayes (NB) classifier. The study aims to highlight the challenges of pattern analysis from an unsupervised machine learning perspective using real world, heterogeneous data.
+
+# Data 
+The dataset of interest was sourced privately through a contact from St Peter's hospital in Surrey, United Kingdom (NHS Ashford and St Peter's Hospital, 2014). The data was collected by the National Health Service (NHS) during an observational study from 2010 to 2011. Initially, `r ncol(data1)` data items and `r nrow(data1)` observations of patients is presented. To the best of our knowledge, no known interventions or pre-processing were applied to this data. However the current study pursued extensive pre-processing so that only `r ncol(data2)` variables were selected for analysis. Briefly, NA values were omitted and two variables were calculated, including *Length.of.Stay* and *RTT.Period*. The relevant variables with their descriptions are summarised below in Table \@ref(tab:variables) (NHS, 2010).
+
+```{r variables }
+# Create a dataframe to display data items with associated definitions
+var_defs = data.frame("Variable" = c("Adm.Type", "HRG4", "ICD10", "OPCS4", "PbR", "Patient.Age", "Specialty.Code", "Length.of.Stay", "RTT.Period", "Cost.Class"),
+                      "Data Type" = c("Factor, 3 levels", "Factor, 881 levels", "Factor, 1899 levels", "Factor, 1223 levels", "Binary", "Numeric, Discrete", "Factor, 45 levels", "Numeric, Discrete", "Numeric Discrete", "Factor, 6 levels"),
+                      "Description" = c("Admission of non-elective, elective day case or in-patient.", "Grouping of procedure codes.", "International classification of diseases code.", "Classification of interventions and procedures.", "Payment by result received.", "Age of patient in years.", "Code of main specialty involved.", "Difference between admission and discharge dates.", "Perior from GP referral to commencement of treatment.", "Discretized cost levels."))
+
+# Use kable() for fancy display of table
+var_defs %>%
+  kable(caption = "Data items and definitions.") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = F, position = "center", font_size = 12)
+
+```
+
+# Methods 
+R Studio was used to perform all pre-processing and analyses in the current report (R Studio, 2016). Overall, the current study sought to identify the challenges of knowledge discovery of health data from unsupervised and supervised perspectives. To commence unsupervised clustering, a real-world hospital dataset containing multi-level factor, categorical, and discrete numeric variables, was prepared by computing its Gower distances without the cost level variable (Muhaimin, 2018). This was achieved using the `daisy()` function including the Gower metric. Before clustering the distances with PAM, a silhouette width plot at various k values, ranging from 2 to 8, was plotted to select an appropriate number of clusters (Muhaimin, 2018; Kaoungky et al., 2018; Murugananthi & Ramyachitra, 2014). This led to the selecting k-values of 3 and 6. 
+
+To visualise the PAM models’ ability to cluster a sizeable Gower distance matrix, two dimensionality reduction techniques were used, including tSNE, and PCoA (Belkina et al., 2018; Filaire, 2018; Martin, 2016). For tSNE, the `Rtsne()` function was used and adjusted for *is_distance=TRUE*. This output was visualised using `ggplot()` in multiple plots for comparisons. The `geom_point()` colour aesthetic was used in one plot to highlight points that were clustered by the PAM model, and in another to highlight the true cost label to see the effectiveness of this protocol in clustering similar patients’ cost outcomes. The same procedure was repeated, using the PCoA protocol. However, to perform PCoA, `cmdscale()` was used with *eig=TRUE* to enable calculation of the variance explained by the two principal co-ordinate dimensions. 
+
+The group memberships set by PAM were compared with Ward’s hierarchical method. To perform Ward's hierarchical clustering, the Gower distance matrix was applied to the `hclust()` function with the *ward.D2* metric. Next, the resulting dendrogram was visualised, using `as.dendrogram()`, alongside four colour-coded bars below its leaflets. These represent the colours of observations clustered by Ward’s method, PAM at K=3 and K=6, and the true cost label. Together, this allowed visual evaluation of the clustering models’ ability to group patients of similar attributes, and to see if these grouped observations are similar to the cost label. Ward’s method and PAM (K=6) group membership of observations were also compared in frequency crosstabs, which were plotted in heatmap visuals using `geom_tiles()`.
+
+Finally, the current study sought to compare the unsupervised learning pathway with a supervised model on the same dataset. To achieve this, a NB classifier was trained in duplicate; the first using a typical 70:30 split for training and testing validation, and the second using a 10-fold cross validation protocol. Laplace smoothing was applied as some variables' factors may not have been represented in the training subset. A confusion matrix for both models was calculated using the `confusionMatrix()` function. Furthermore, the `multiclass.roc()` and `plot.roc()` functions were combined in a custom function to visualise the ROC-AUC plots. Lastly, the `varImp()` function was used on the output of the 10-fold cross-validated NB model to identify the contributions of the predictor variable to predict the cost. Overall, this allowed adequate assessment and comparisons of unsupervised clustering and supervised classification on real hospital data, thereby highlighting the challenges that come with these methods.
+
+# Results and Discussion 
+Overall, the results show some congruency and feasibility between the different unsupervised cluster and NB classifier models. Firstly, to validate the resulting Gower distance matrix, the output distances were cross-referenced with the raw data to find two pairs of observations deemed most (dis)similar. The result of this query, as seen in Table \@ref(tab:similarity) below, indicate that the Gower method worked well in calculating the distanced between mixed type attributes. With a validated Gower distance matrix, PAM and Ward’s hierarchical clustering were performed. 
+
+```{r gower }
+# calculate gower distance WITHOUT cost classification label
+
+gower_dist = daisy(data3, metric = "gower")
+gower_mat = as.matrix(gower_dist)
+```
+
+```{r similarity }
+
+# Sanity check
+# most similar patients/observations
+most_similar = data3[which(gower_mat == min(
+  gower_mat[gower_mat != min(gower_mat)]), arr.ind = TRUE)[1, ], ]
+
+# most dissimilar patients/obs
+most_dissimilar = data3[which(gower_mat == max(
+  gower_mat[gower_mat != max(gower_mat)]), arr.ind = TRUE)[1, ], ]
+
+# combine both for table presentation using kable()
+gower_check = rbind(most_similar, most_dissimilar)
+knitr::kable(gower_check, caption = 'Pairs of most similar and dissimilar observations.') %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "hover"), full_width =F, font_size = 12) %>%
+  row_spec(1:2, background = "gold") %>%
+  row_spec(3:4, background = "skyblue") %>%
+  footnote(general = "Pairs of observations that are most similar (gold) and most dissimilar (blue).")
+```
+
+To visualise the PAM clustering models in lower dimensional spaces, the Gower distance matrix was applied to both tSNE and PCoA separately. To select an appropriate number of clusters for PAM, a Silhouette width plot over a range of 2 to 8 clusters was visualised. As seen in Figure \@ref(fig:silhouette) below, the optimal K-values for PAM are 3. However, both 3 and 6 were included in this study as it was hypothesised that 6 clusters of PAM may relate more closely to the 6 levels of the cost variable. The 6-level cost variable was then applied as a colour aesthetic for the PAM cluster scatterplots, which can be seen below in Figure \@ref(fig:clustervisuals). 
+
+The results of the PAM clustering scatterplots show that the data is somewhat clusterable. In Figure \ref@(fig:clustervisuals) below, PAM (k=6) is visualised using t-SNE and PCoA with the true cost label. Clusters of similar colours indicate similar cost ranges, meaning that PAM was able to group patients based on a select range of attributes that then are in fact somewhat associated with similar costs. Although the two dimensions of PCoA only account for approximately 30% of the total variance, clusters of similar cost-related colours are reliably distinct from one another. It appears that PCoA produces more distinguishable clusters than t-SNE in this particular outcome. The outcomes of PAM (k=3) and scatterplots without the class label can be seen in Appendix \@ref(fig:appendix) below, which show that no observable differences in PAM (k=3) and PAM (k=6) as seen when the true cost label is applied. 
+
+```{r silhouette, out.width='50%', out.height = '50%', fig.cap="Silhouette width of PAM at different k values."}
+# What number of k (clusters) for PAM should be used? Use silhouette widths plot to help.
+set.seed(0)
+# Try K-values from 2 to 8
+sil_width <- c(NA)
+for(i in 2:8){  
+  pam_fit = pam(gower_dist, diss = TRUE, k = i)  
+  sil_width[i] = pam_fit$silinfo$avg.width  
+}
+
+# Plot silhouette widths at cluster numbers 2-8
+plot(1:8, sil_width,
+     xlab = "Number of clusters",
+     ylab = "Silhouette Width", lines(1:8, sil_width),
+     main = "Silhoette Width of PAM Clusters",
+     cex.lab = 0.8, cex.axis = 0.8, cex.main = 1.2)
+
+```
+
+```{r PAM } 
+# Define PAM clustering at k=3 and k=6
+set.seed(0)
+# PAM (k = 3)
+pam_fit = pam(gower_dist, diss = TRUE, k = 3)
+pam_results = data3 %>%
+  mutate(cluster = pam_fit$clustering) %>% # attach group memberships to data
+  group_by(cluster) %>%
+  do(the_summary = summary(.)) # for interest in viewing summary of clusters
+
+# PAM (k = 6)
+pam_fit2 = pam(gower_dist, diss = TRUE, k = 6)
+pam_results2 = data3 %>%
+  mutate(cluster = pam_fit2$clustering) %>%
+  group_by(cluster) %>%
+  do(the_summary = summary(.))
+
+```
+
+```{r pam1 }
+set.seed(0)
+# Use tSNE to visualise of PAM at k=3
+tsne_obj = Rtsne(gower_dist, is_distance = TRUE)
+
+# tSNE-PAM k = 3
+tsne_data = tsne_obj$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(pam_fit$clustering),
+         name = data2$Cost.Class)
+
+# colour based on PAM-assigned cluster
+PAM1 = ggplot(aes(x = X, y = Y), data = tsne_data) +
+  geom_point(aes(color = cluster,
+                 alpha=0.4), size = 0.3) + 
+  ggtitle("tSNE of PAM (K=3) clusters") +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  scale_fill_manual(values = c('dodgerblue3', 'coral3', 'green4'),
+                    name = "PAM Clusters") + 
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "PAM(K=3)")
+
+# colour based on TRUE cost label
+PAM_true = ggplot(aes(x = X, y = Y), data = tsne_data) +
+  geom_point(aes(color = cost_label,
+                 alpha=0.4), size = 0.3, name ="True Cost") + 
+  ggtitle("tSNE of PAM (K=3) with true cost label") +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  scale_fill_manual(values = c('dodgerblue3', 'coral3', 
+                               'green4', 'magenta4', 'yellow2','chartreuse')) +
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "True Cost") # legend for true cost label
+```
+
+```{r pam2 }
+set.seed(0)
+# tSNE-PAM k=6
+# PAM k = 6
+tsne_data2 = tsne_obj$Y %>%
+  data.frame() %>%
+  setNames(c("X2", "Y2")) %>%
+  mutate(cluster2 = factor(pam_fit2$clustering))
+
+par(mfrow=c(1,2))
+# colour based on PAM-assigned cluster 
+PAM2 = ggplot(aes(x = X2, y = Y2), data = tsne_data2) +
+  geom_point(aes(color = cluster2, 
+                 alpha=0.4), size = 0.3) + 
+  ggtitle("tSNE of PAM (K=6) clusters") +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  scale_fill_manual(name = "PAM Clusters") +
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "PAM(K=6)")
+
+# colour based on true class label
+PAM2_true = ggplot(aes(x = X2, y = Y2), data = tsne_data2) +
+  geom_point(aes(color = cost_label, 
+                 alpha=0.4), size = 0.3) + 
+  ggtitle("tSNE of PAM (K=6) with true cost label") +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  scale_fill_manual(name = "True Cost") +
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "True Cost")
+
+PAM2_true2 = ggplot(aes(x = X2, y = Y2), data = tsne_data2) +
+  geom_point(aes(color = cost_label, 
+                 alpha=0.4), size = 0.3) + 
+  ggtitle("tSNE of PAM (K=6) with true cost label") +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(name = "True Cost") +
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "True Cost")
+```
+
+```{r PCoA }
+set.seed(0)
+#Principal Coordinate Analysis (Classical Multi-Dimensional Scaling)
+
+# eig = TRUE returns eigenvalues to calculate proportion of variance explained
+multi_dim_scale = cmdscale(gower_dist, k = 2, eig = TRUE) 
+
+# calculate proportion of variance explained using eigen values
+mds_variance = round(multi_dim_scale$eig/sum(multi_dim_scale$eig)*100, 1)
+
+# combine two dimensions from PCoA for ggplotting
+mds_values = multi_dim_scale$points
+mds_data = data.frame(Sample = rownames(mds_values), 
+                      x = mds_values[,1], 
+                      y = mds_values[,2])
+
+```
+
+```{r MDSggplot }
+# ggplot visualisation of PCoA-PAM with TRUE cost label
+# this one goes to appendix (legend position on right side)
+MDS_true = ggplot(data = mds_data) +
+  geom_point(aes(x = x, y = y,
+                 color = cost_label,
+                 alpha=0.4), size = 0.3) +
+  theme_minimal() +
+  xlab(paste("PCoA1 - ", mds_variance[1], "%", sep = "")) + 
+  ylab(paste("PCoA2 - ", mds_variance[2], "%", sep = "")) +
+  ggtitle("PCoA of Gower with true cost label") + 
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  scale_fill_manual(values = c('dodgerblue3', 'coral3', 
+                               'green4', 'magenta4', 'yellow2','chartreuse'),
+                    name = "True Cost") +
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "True Cost")
+
+# create duplicate for in-text plot (legend position at bottom)
+MDS_true2 = ggplot(data = mds_data) +
+  geom_point(aes(x = x, y = y,
+                 color = cost_label,
+                 alpha=0.4), size = 0.3) +
+  theme_minimal() +
+  xlab(paste("PCoA1 - ", mds_variance[1], "%", sep = "")) + 
+  ylab(paste("PCoA2 - ", mds_variance[2], "%", sep = "")) +
+  ggtitle("PCoA of Gower with true cost label") + 
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values = c('dodgerblue3', 'coral3', 
+                               'green4', 'magenta4', 'yellow2','chartreuse'),
+                    name = "True Cost") +
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "True Cost")
+
+# PCoA of PAM(k=6) for appendix
+MDS_PAM = ggplot(data = mds_data) +
+  geom_point(aes(x = x, y = y,
+                 color = factor(pam_fit2$clustering),
+                 alpha=0.4), size = 0.3) +
+  theme_minimal() +
+  xlab(paste("PCoA1 - ", mds_variance[1], "%", sep = "")) + 
+  ylab(paste("PCoA2 - ", mds_variance[2], "%", sep = "")) +
+  ggtitle("PAM (k=6) visual with PCoA") +
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 5),
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 8),
+        plot.title = element_text(size = 10)) +
+  scale_fill_manual(values = c('dodgerblue3', 'coral3', 
+                               'green4', 'magenta4', 'yellow2','chartreuse'),
+                    name = "PAM Clusters") +
+  guides(alpha = FALSE, size = FALSE,
+         color = guide_legend(override.aes = list(size = 4))) +
+  labs(color = "PAM(K=6)")
+```
+
+Although PCoA reduced the distance matrix to two dimensions that explain collectively approximately only 31% of the variance, it was sufficiently effective in preserving the local distances between observations. Indeed, the most interesting outcome overall is seen when comparing subplots D and F, where one can identify clusters of similar cost labels. This means that without the cost label, PAM, visualised using either tSNE or PCoA, is able to cluster patients of similar attributes together, which then in turn pertains to specific costs. This observation concurs with the hypothesis that the select attributes collectively contribute to a specific cost outcome as they describe a patient’s pathway from medical diagnosis to treatment. As such, these preliminary findings show that this complex dataset is describable using PAM coupled with tSNE or PCoA.  
+
+```{r clustervisuals, fig.width = 6, fig.cap="Dimensionally reduced solutions from PCoA and tSNE to visualise PAM clusters with true cost label."}
+
+# Combine two plots of tSNE and PCoA of PAM(k=6) that show TRUE cost label
+plot_grid(PAM2_true2, MDS_true2, labels = "AUTO", ncol=2, nrow = 1)
+
+```
+
+```{r ward, message = FALSE, warning=FALSE }
+set.seed(0)
+# Ward's hclust using gower distance matrix
+hclust_ward = hclust(gower_dist, method = "ward.D2")
+```
+
+```{r crosstabs, warning = FALSE, message = FALSE}
+# Evaluate HClust and PAM's performance in allocating clusters vs true cost label
+# cut tree into 6 clusters
+hclusters = cutree(hclust_ward, k=6)
+
+# combine group memberships to compare True cost vs Ward vs PAM(k=6)
+true_wards = as.data.frame(table(True=cost_label, Wards=hclusters))
+true_PAM = as.data.frame(table(True=cost_label, PAM=pam_fit2$clustering))
+wards_PAM = as.data.frame(table(Wards=hclusters, PAM=hclusters))
+
+```
+
+To further assess the clusterability of this dataset, Ward’s method of hierarchical clustering was applied to compare with the PAM model. The group memberships of Ward’s method and PAM were compared with one another alongside the true cost class. These results are visualised as heatmaps, as seen in Figure \@ref(fig:heatmaps) below. The frequencies of group memberships differ somewhat when the cluster models are compared with the true cost class. Both PAM and Ward's method showed some exclusive observations grouped nearly exclusively into cluster #6 when compared to the true cost label. Ward's cluster number 4 has only members of cost class 1. However, its cluster numbers 2 and 3 contained costs of all levels. Similarly, PAM's cluster numbers 1, 2, and 4 also contained members of all cost levels to varying extents. This shows the difficulty in unsupervised clustering.
+
+```{r heatmaps, strip.white = TRUE, fig.height = 3, fig.cap="Frequencies of group memberships across clusters defined by Ward's Hierarchical and PAM compared with the ground truth."}
+# visualise group memberships as heatmaps
+
+cross1 = ggplot(true_wards, aes(True, Wards)) +
+  geom_tile(aes(fill = Freq), colour = "black") + 
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme(legend.position = "top", 
+        legend.text = element_text(size=6),
+        legend.title = element_text(size = 10))
+
+cross2 = ggplot(true_PAM, aes(True, PAM)) +
+  geom_tile(aes(fill = Freq), colour = "black") + 
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme(legend.position = "top", 
+        legend.text = element_text(size=6),
+        legend.title = element_text(size = 10))
+
+cross3 = ggplot(wards_PAM, aes(PAM,  Wards)) +
+  geom_tile(aes(fill = Freq), colour = "black") + 
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme(legend.position = "top", 
+        legend.text = element_text(size=6),
+        legend.title = element_text(size = 10))
+
+#combine heatmaps
+plot_grid(cross1, cross2, cross3, labels = "AUTO", ncol=3, scale = 0.7)
+
+```
+
+The aforementioned results concur with Ward’s dendrogram. In Figure \@ref(fig:dendrogram) below, the colour-coded group memberships of PAM at k=3 and k=6, Ward’s method, and the true cost label are compared. Overall, it can be seen that both PAM and Ward’s method share similar clusters of groups. However, Figure \@ref(fig:dendrogram) clearly shows the contrast in colours of the true cost label, indicating that observations of different class levels were clustered together. This was seen also in Figure \@ref(fig:heatmaps) above. Upon close inspection, it can be noted that some groups of similar cost levels can be seen, which means that Ward’s method was able to cluster some observations close to their real cost levels in unsupervised. PAM (k=6) also follows some patterns with the grouping seen in the true label, suggesting that the clusters made by Ward are similar to those in both PAM models. As such, the cluster assessment overall shows somewhat satisfactory unsupervised pattern recognition of the data. Although this assessment and analysis is somewhat subjective, the results are impressive considering patterns are observable looking at a highly dimensional and heterogeneous dataset using an unsupervised approach. 
+
+```{r dendrogram, strip.white = TRUE, fig.cap="Ward's hierarchical clustering dendrogram with three colour-coded bars for label and cluster comparisons."}
+# Plot Ward's Dendrogram
+dendro = as.dendrogram(hclust_ward)
+dendro.col = dendro %>% 
+  set("branches_k_color", k = 6, #customise branch colours
+      value = c("darkslategray", "darkslategray4",
+                "darkslategray3", "gold3", "darkcyan", "cyan3")) %>%
+  set("branches_lwd", 0.6)
+
+# define the colour bar labels for comparisons of PAM(k=3 & 6), Ward's and true cost label
+the_bars = cbind(pam_fit$clustering, pam_fit2$clustering, cost_label, hclusters)
+
+plot(dendro.col, leaflab = "none",
+     ylab = "Height")
+
+colored_bars(the_bars, dendro.col, sort_by_labels_order = T, y_shift = -0.5, 
+             rowLabels = c("PAM (k=3)", "PAM (k=6)", "True Cost", "Ward's"), cex.rowLabels = 0.6)
+
+```
+
+To compare the efficacy of using unsupervised clustering in deriving patterns from the current dataset, an NB classifier was applied. Firstly, the supervised learning protocol was significantly faster, simpler, and more reliable in its assessment. The main outcome, shown in Figure \@ref(fig:ROC) below, was that when trained and validated using a typical 70:30 split of the dataset, the NB classifier produced an AUC of 0.921 and an impressive average predictive accuracy of ~85%. When cross-validated by a 10-fold scheme, an AUC of 0.87 and accuracy of 76% was achieved. Overall, this is considered a success of predictive power, especially considering that the cost variable was discretized into a 6-level factor, which would have led to some loss of information and precision (Quinn, 2004). 
+
+The NB classifier was also able to show the variable contributions in predicting each level of the cost variable, which is visualised in Figure \@ref(fig:features). Interestingly, Length.of.Stay is most relevant in the mid range cost of £660-1,490, but least important in the lowest cost range. Furthermore, HRG4 is most important for predicting the lowest and highest cost levels of £0-529 and £2,840-167,000. This variable is only second to PbR for the remaining levels. Collectively, these results show the predictability of cost changes at different increments and is affected by different variables at these varying levels. Therefore, it is clear why these complex relationships would be difficult to reveal using unsupervised clustering techniques. Overall, not only did the NB classifier show satisfactory predictability of cost, but it also offered a glimpse into the intricate relationships between the explanatory variables at different levels. This further clarifies why it is difficult to rely solely on PAM and Ward’s hierarchical clustering to describe patients’ cost from an unsupervised perspective. 
+
+```{r naivebayes, warning = FALSE, message = FALSE }
+# Define NB for Supervised Classification Prediction 
+set.seed(1)
+
+num_obs = dim(data2)[1]
+test_id = sample(num_obs, size = as.integer(num_obs*0.3), replace = FALSE)
+train_id = -test_id
+testing = data2[test_id,]
+training = data2[train_id,]
+
+# Naive Bayes Model
+nb1 = naive_bayes(Cost.Class ~., 
+                  data = data2, laplace = 1) # laplace smoothing for new factor levels in test subset
+nb1_pred = predict(nb1, newdata = testing, type = "class")
+nb1_pred_prob = predict(nb1, newdata = testing, type = "prob")
+
+```
+
+```{r NB}
+## Evaluate NB Classifier
+data_predictor = cbind(as.data.frame(nb1_pred), "responses" = testing$Cost.Class)
+
+# NB1 ROC-AUC
+multi_roc1 = multiclass.roc(formula = nb1_pred ~ responses, data = data_predictor)
+
+# Naive Bayes Confusion Matrix
+nb1_confMat = confusionMatrix(data = nb1_pred, testing$Cost.Class, 
+                             positive = levels(testing$Cost.Class)[6])
+```
+
+```{r NB 10-fold, warning=FALSE, message=FALSE }
+# Naive Bayes model with 10-fold cross validation 
+nb2_x = training[,1:9]
+nb2_y = factor(training$Cost.Class)
+
+nb2 = train(nb2_x, nb2_y, 'nb', trControl = 
+                   trainControl(method = 'cv', number = 10)) # 10-fold cross validation
+
+nb2_predict = predict(nb2, newdata = testing)
+data_pred2 = cbind(as.data.frame(nb2_predict), 
+                   "responses" = testing$Cost.Class)
+
+# NB2 ROC-AUC
+multi_roc2 = multiclass.roc(formula = nb2_predict ~ responses, data = data_predictor)
+
+# NB2 confusion matrix
+nb2_confMat = confusionMatrix(nb2_predict, 
+                               factor(testing$Cost.Class))
+
+```
+
+```{r ROC, fig.height=3, fig.cap="ROC-AUC and accuracy metrics for predicting each cost level using two Naive Bayes models."}
+# ROC-AUC plots
+par(mfrow=c(1,2))
+# ROC-AUC Plot 1 (70:30 CV NB)
+rs1 = multi_roc1[['rocs']]
+roc_plot1 = plot.roc(rs1[[1]], 
+                     main = paste("A) AUC: ", round(multi_roc1$auc, 3), 
+                                  "\n Accuracy: ", round(nb1_confMat$overall['Accuracy']*100, 2), "%"),
+                     cex.main = 0.8)
+
+invisible(sapply(2:length(rs1),function(i) lines.roc(rs1[[i]],col=i)))
+
+# ROC-AUC Plot 2 (10-fold CV NB)
+rs2 = multi_roc2[['rocs']]
+roc_plot2 = plot.roc(rs2[[1]], 
+                     main = paste("B) 10-Fold CV, AUC: ", round(multi_roc2$auc, 3), 
+                                  "\n Accuracy: ", round(nb2_confMat$overall['Accuracy']*100, 2), "%"),
+                     cex.main = 0.8)
+
+invisible(sapply(2:length(rs2),function(i) lines.roc(rs2[[i]],col=i)))
+
+```
+
+```{r features, out.height='50%', out.width='50%', fig.cap="Variables' contributions in predicting each cost level using Naive Bayes with 10-fold cross-validation."}
+# Feature importance analysis 
+var_import = varImp(nb2)
+
+# rename different cost levels for seamless analysis
+colnames(var_import$importance) = c("£0-529", "£529-660", "£660-864", "£864-1,490","£1,490-2,840", "£2,840-167,000")
+
+# visualise variable importance lollipop plot
+var_plot = plot(var_import)
+var_plot
+
+```
+
+# Conclusion 
+In conclusion, the current investigation aimed to shed light upon the challenges and feasibility of using unsupervised clustering on real world, sizeable and heterogeneous hospital data. The computation of a Gower distance matrix allowed the application of PAM and Ward’s hierarchical clustering of mixed type data, which was visualised in lower dimensions using t-SNE and PCoA. While PCoA showed clear distinctions between clusters indicated by the cost label, it was still difficult to identify clear relationships even in conjuction with Ward’s hierarchical clustering. One significant shortcomming in the current study is that processing the Gower distance matrix and PCoA is nearly impractical due to excessive computation time required. Although the study was also limited in quantitative assessment of the clustering techniques, by introducing the cost label following PAM and Ward's clustering, we were able to show that these methods could visualise some groups of similar cost levels. Furthermore, an NB classifier was able to show complex relationships between the predictor variables and cost at an overall accuracy ranging from 75-85%, which is considered a success given the complex nature of the dataset in question. 
+
+# References 
+Akay, O. and Yuksel, G. (2017). Clustering the Mixed Panel Dataset using Gower’s Distance and K-Prototypes Algorithms. Communications in Statistics – Simulation and Computation. Doi: 10.1080/03610918.2016.1367806
+Al-Aidaroos, K. M., Bakar, A. A., & Othman, Z. (2012). Medical Data Classification with Naive Bayes Approach. Information Technology Journal. doi:10.3923/itj.2012
+Belkina, A.C., Ciccolella, C.O., Anno, R., Halpert, R., Spidlen, J., Cappione, J.E.S. (2019). Automated optimized parameters for T-distributed stochastic neighbor embedding improve visualization and analysis of large datasets. Nat Commun 10, 5415. https://doi.org/10.1038/s41467-019-13055-y
+Budiaji, W., & Leisch, F. (2019). Simple K-Medoids Partitioning Algorithm for Mixed Variable Data. Algorithms, 12(177). doi:10.3390/a12090177
+Filaire, T. (2018). Clustering on mixed type data.  Retrieved from https://towardsdatascience.com/clustering-on-mixed-type-data-8bbd0a2569c3
+Gower, J. C. (1966). Some distance properties of latent root and vector methods used in multivariate analysis. Biometrika, 53(3-4), 325-338. doi:10.1093
+Gower, J.C. (1971). A general coefficient of similarity and some of its properties. Biometrics, 27:4, pp. 857-874. 
+Jothi, N., Rashid, N. A. A., & Husain, W. (2015). Data Mining in Healthcare – A Review. Procedia Computer Science, 72, 306-313. doi:10.1016/j.procs.2015.12.145
+Kaoungku, N., Suksut, K., Chanklan, R., Kerdprasop, K., & Kerdprasop, N. (2018). The Silhoette Width Criterion for Clustering and Association Mining to Select Image Features. International Journal of Machine Learning and Computing, 8(1), 69-73. doi:10.18178/ijmlc.2018.8.1.665
+Lewis, D.D. (1998). Naïve (Bayes) at Forty: The Independence Assumption in Information Retrieval. ECM ’98: Proceedings of the 10th European Conference on Machine Learning, pp. 4-15. 
+Martin, D.P. (2016). Clustering Mixed Data Types in R. Wicked Good Data, from https://dpmartin42.github.io/posts/r/cluster-mixed-types 
+Mikulic, M. (2019). Health expenditure as a percentage of GDP in select countries 2018. Retrieved from https://www.statista.com/statistics/268826/health-expenditure-as-gdp-percentage-in-oecd-countries/
+Muhaimin, M. (2018). Clustering categorical and numerical datatype using Gower distance. Medium from https://medium.com/@rumman1988/clustering-categorical-and-numerical-datatype-using-gower-distance-ab89b3aa90d9 
+Nguyen, L.H., and Holmes, S. (2019). Ten quick tips for effective dimensionality reduction. PLOS Computational Biology, 15(6). Doi: 10.1371/journal.pcbi.1006907
+NHS Ashford and St. Peter's Hospital. (2014, May 20). St Peter's Hospital. Retrieved from Ashford St. Peter's NHS: http://www.ashfordstpeters.nhs.uk/st-peter-s-hospital/82-st-peter-s-hospital
+NHS. (2010). Main Specialty Code. Retrieved from Data Dictionary NHS: https://www.datadictionary.nhs.uk/data_dictionary/attributes/m/main_specialty_code_de.asp?shownav=1
+Park, H.S. and Jun, C.H. (2009). A simple and fast algorithm for K-medoids clustering. Expert Systems with Applications, 36, pp. 3336-3341. Doi: 10.1016/j.eswa.2008.01.039
+Quinn, K.M. (2004). Bayesian factor analysis for mixed ordinal and continuous responses. Political Analysis, 12: 4. Pp. 338-353. Doi: 1093/pan/mph022
+RStudio Team (2016). RStudio: Integrated Development for R. RStudio, Inc., Boston, MA URL http://www.rstudio.com/.
+Vihinen, M. (2012). How to evaluate performance of prediction methods? Measures and their interpretation in variation effect analysis. BMC Genomics, 13. doi:10.1186
+
+# Appendix 
+
+```{r appendix, fig.height = 8, fig.cap="Dimensionally reduced solutions from PCoA and tSNE to visualise PAM (k=3 and 6) clusters compared to true cost label."}
+
+plot_grid(PAM1, PAM_true, PAM2, PAM2_true, 
+          MDS_PAM, MDS_true, labels = "AUTO", ncol=2, nrow = 3)
+
+```
+
